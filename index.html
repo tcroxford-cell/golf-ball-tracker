@@ -1,638 +1,550 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>Golf Ball Tracker – Predicted Launch Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+import math
+import sys
+import threading
+import time
 
-  <!-- PWA manifest -->
-  <link rel="manifest" href="manifest.json" />
-  <meta name="theme-color" content="#22c55e" />
+import pygame
+import cv2
+import numpy as np
 
-  <!-- iOS PWA tweaks -->
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="GolfTracker" />
+# ==========================
+# CONFIG
+# ==========================
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 700
+FPS = 60
 
-  <style>
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
+GRAVITY = 9.81  # m/s^2
+PIXELS_PER_METER = 2.0
 
-    body {
-      background: #020617;
-      color: #f9fafb;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
+GREEN = (34, 139, 34)
+DARK_GREEN = (0, 100, 0)
+SAND = (237, 201, 175)
+BLUE = (0, 0, 255)
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+FAIRWAY = (46, 139, 87)
+BACKGROUND = (80, 180, 255)
+RED = (255, 0, 0)
+GREY = (100, 100, 100)
+PANEL_BG = (30, 30, 30)
+PANEL_BORDER = (200, 200, 200)
+PANEL_TEXT = (230, 230, 230)
+PANEL_HIGHLIGHT = (80, 80, 160)
 
-    header {
-      padding: 12px 16px;
-      background: #0f172a;
-      border-bottom: 1px solid #1f2937;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
+pygame.init()
+FONT = pygame.font.SysFont("arial", 18)
+BIG_FONT = pygame.font.SysFont("arial", 32)
 
-    header h1 {
-      font-size: 1.1rem;
-      font-weight: 600;
-    }
+# Set this to your phone camera stream URL (e.g. IP Webcam)
+# Example: "http://192.168.0.10:8080/video"
+PHONE_CAM_URL = "http://192.168.0.10:8080/video"
 
-    header span {
-      font-size: 0.8rem;
-      opacity: 0.8;
-    }
 
-    main {
-      flex: 1;
-      padding: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
+# ==========================
+# DATA STRUCTURES
+# ==========================
+class Hole:
+    def __init__(self, index, par, tee_pos, pin_pos, fairway_rect, green_rect, bunker_rects):
+        self.index = index
+        self.par = par
+        self.tee_pos = tee_pos
+        self.pin_pos = pin_pos
+        self.fairway_rect = fairway_rect
+        self.green_rect = green_rect
+        self.bunker_rects = bunker_rects
 
-    .layout {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
 
-    @media (min-width: 900px) {
-      .layout {
-        flex-direction: row;
-      }
-    }
+class ShotData:
+    def __init__(self, club_speed, swing_speed, ball_speed, launch_angle_deg, carry_estimate):
+        self.club_speed = club_speed
+        self.swing_speed = swing_speed
+        self.ball_speed = ball_speed
+        self.launch_angle_deg = launch_angle_deg
+        self.carry_estimate = carry_estimate
 
-    .panel {
-      background: #020617;
-      border-radius: 12px;
-      border: 1px solid #1f2937;
-      padding: 10px;
-      flex: 1;
-      min-width: 0;
-    }
 
-    .panel h2 {
-      font-size: 0.95rem;
-      margin-bottom: 6px;
-      font-weight: 600;
-    }
+class Ball:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.vx = 0.0
+        self.vy = 0.0
+        self.in_flight = False
 
-    .section-subtitle {
-      font-size: 0.75rem;
-      opacity: 0.75;
-      margin-bottom: 6px;
-    }
+    def launch(self, shot_data: ShotData):
+        angle_rad = math.radians(shot_data.launch_angle_deg)
+        v = shot_data.ball_speed
+        self.vx = v * math.cos(angle_rad)
+        self.vy = v * math.sin(angle_rad)
+        self.in_flight = True
 
-    .camera-container {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
+    def update(self, dt):
+        if not self.in_flight:
+            return
+        self.vy -= GRAVITY * dt
+        self.x += self.vx * dt * PIXELS_PER_METER
+        self.y -= self.vy * dt * PIXELS_PER_METER
+        if self.y > SCREEN_HEIGHT - 50:
+            self.y = SCREEN_HEIGHT - 50
+            self.in_flight = False
 
-    video {
-      width: 100%;
-      border-radius: 10px;
-      background: #000;
-      max-height: 260px;
-      object-fit: cover;
-    }
 
-    .btn-row {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-    }
+class GameState:
+    def __init__(self, holes):
+        self.holes = holes
+        self.current_hole_index = 0
+        self.ball = Ball(holes[0].tee_pos[0], holes[0].tee_pos[1])
+        self.strokes_per_hole = [0 for _ in holes]
+        self.total_strokes = 0
+        self.last_shot_data = None
+        self.hole_finished = False
+        self.message = "Press S to open shot panel."
 
-    button {
-      flex: 1;
-      padding: 8px 10px;
-      border-radius: 999px;
-      border: none;
-      font-size: 0.85rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.15s ease;
-    }
+    @property
+    def current_hole(self):
+        return self.holes[self.current_hole_index]
 
-    button.primary {
-      background: #22c55e;
-      color: #022c22;
-      box-shadow: 0 2px 6px rgba(34, 197, 94, 0.4);
-    }
+    def reset_ball_to_tee(self):
+        hole = self.current_hole
+        self.ball = Ball(hole.tee_pos[0], hole.tee_pos[1])
+        self.ball.in_flight = False
 
-    button.secondary {
-      background: #111827;
-      color: #e5e7eb;
-      border: 1px solid #374151;
-    }
+    def next_hole(self):
+        if self.current_hole_index < len(self.holes) - 1:
+            self.current_hole_index += 1
+            self.reset_ball_to_tee()
+            self.hole_finished = False
+            self.message = "New hole. Press S for shot panel."
+        else:
+            self.message = "Round finished! Press ESC to quit."
 
-    button:active {
-      transform: translateY(1px) scale(0.99);
-      box-shadow: none;
-    }
+    def register_shot(self, shot_data: ShotData):
+        self.last_shot_data = shot_data
+        self.strokes_per_hole[self.current_hole_index] += 1
+        self.total_strokes += 1
 
-    button:disabled {
-      opacity: 0.6;
-      cursor: default;
-      box-shadow: none;
-    }
+    def auto_putt(self):
+        hole = self.current_hole
+        dx = (self.ball.x - hole.pin_pos[0]) / PIXELS_PER_METER
+        dy = (self.ball.y - hole.pin_pos[1]) / PIXELS_PER_METER
+        dist_m = math.sqrt(dx * dx + dy * dy)
 
-    .metrics-row {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      margin-top: 8px;
-    }
+        if dist_m < 1.5:
+            putts = 1
+        elif dist_m < 5:
+            putts = 2
+        elif dist_m < 15:
+            putts = 3
+        else:
+            putts = 4
 
-    .metric-card {
-      flex: 1;
-      min-width: 90px;
-      background: #020617;
-      border-radius: 8px;
-      padding: 6px 8px;
-      border: 1px solid #1f2937;
-    }
+        self.strokes_per_hole[self.current_hole_index] += putts
+        self.total_strokes += putts
+        self.hole_finished = True
+        self.message = f"Hole complete! Auto-putt: {putts} putts. Press N for next hole."
 
-    .metric-label {
-      font-size: 0.65rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      opacity: 0.7;
-    }
 
-    .metric-value {
-      font-size: 1rem;
-      font-weight: 600;
-      margin-top: 2px;
-    }
+# ==========================
+# COURSE SETUP
+# ==========================
+def create_sample_course():
+    holes = []
+    for i in range(9):
+        par = 3 if i % 3 == 0 else 4
+        tee_x = 100
+        tee_y = 500
+        pin_x = 900
+        pin_y = 300
+        fairway_rect = pygame.Rect(50, 350, 1000, 200)
+        green_rect = pygame.Rect(850, 250, 150, 100)
+        bunker_rects = [
+            pygame.Rect(500, 400, 80, 60),
+            pygame.Rect(700, 380, 60, 40),
+        ]
+        hole = Hole(
+            index=i + 1,
+            par=par,
+            tee_pos=(tee_x, tee_y),
+            pin_pos=(pin_x, pin_y),
+            fairway_rect=fairway_rect,
+            green_rect=green_rect,
+            bunker_rects=bunker_rects,
+        )
+        holes.append(hole)
+    return holes
 
-    .metric-unit {
-      font-size: 0.7rem;
-      opacity: 0.7;
-      margin-left: 2px;
-    }
 
-    .course-container {
-      position: relative;
-      width: 100%;
-      min-height: 260px;
-    }
+# ==========================
+# COLLISION / ZONES
+# ==========================
+def point_in_rect(x, y, rect: pygame.Rect):
+    return rect.collidepoint(x, y)
 
-    canvas {
-      width: 100%;
-      height: 100%;
-      border-radius: 12px;
-      background: linear-gradient(180deg, #14532d 0%, #166534 40%, #15803d 100%);
-      display: block;
-    }
 
-    .overlay-info {
-      position: absolute;
-      top: 8px;
-      left: 8px;
-      background: rgba(15, 23, 42, 0.85);
-      padding: 6px 8px;
-      border-radius: 8px;
-      font-size: 0.7rem;
-      max-width: 70%;
-    }
+def check_landing_zone(game_state: GameState):
+    hole = game_state.current_hole
+    ball = game_state.ball
 
-    .overlay-info strong {
-      font-weight: 600;
-    }
+    if point_in_rect(ball.x, ball.y, hole.green_rect):
+        game_state.message = "Ball on green! Auto-putting..."
+        game_state.auto_putt()
+        return
 
-    .shot-status {
-      margin-top: 4px;
-      font-size: 0.75rem;
-      opacity: 0.9;
-    }
+    for b in hole.bunker_rects:
+        if point_in_rect(ball.x, ball.y, b):
+            game_state.message = "Ball in bunker. Next shot from here."
+            return
 
-    footer {
-      padding: 6px 10px;
-      font-size: 0.7rem;
-      text-align: center;
-      opacity: 0.7;
-      border-top: 1px solid #020617;
-      background: #020617;
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>Golf Ball Tracker – Predicted Launch Monitor</h1>
-    <span>Net practice • Camera view • Predicted ball flight</span>
-  </header>
+    if point_in_rect(ball.x, ball.y, hole.fairway_rect):
+        game_state.message = "Ball on fairway. Next shot from here."
+    else:
+        game_state.message = "Ball in rough. Next shot from here."
 
-  <main>
-    <div class="layout">
-      <!-- LEFT: Camera + Controls -->
-      <section class="panel">
-        <h2>Camera & shot capture</h2>
-        <p class="section-subtitle">
-          Start the camera, then tap “Record shot” as you hit into the net. The app predicts your launch data.
-        </p>
 
-        <div class="camera-container">
-          <video id="camera" autoplay playsinline muted></video>
-          <div class="btn-row">
-            <button id="startCameraBtn" class="secondary">Start camera</button>
-            <button id="recordShotBtn" class="primary">Record shot</button>
-          </div>
-        </div>
+# ==========================
+# CAMERA HANDLING
+# ==========================
+class CameraCapture:
+    """
+    Simple helper to grab a short burst of frames from the phone camera.
+    This is where you'd plug in real CV/ML to estimate speed/carry.
+    """
 
-        <div class="metrics-row">
-          <div class="metric-card">
-            <div class="metric-label">Club speed</div>
-            <div class="metric-value">
-              <span id="clubSpeedValue">0</span>
-              <span class="metric-unit">mph</span>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Ball speed</div>
-            <div class="metric-value">
-              <span id="ballSpeedValue">0</span>
-              <span class="metric-unit">mph</span>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Launch angle</div>
-            <div class="metric-value">
-              <span id="launchAngleValue">0</span>
-              <span class="metric-unit">°</span>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Direction</div>
-            <div class="metric-value">
-              <span id="directionValue">0</span>
-              <span class="metric-unit">° (L‑ / R+)</span>
-            </div>
-          </div>
-        </div>
+    def __init__(self, url):
+        self.url = url
+        self.frames = []
+        self.running = False
+        self.thread = None
 
-        <div class="metrics-row">
-          <div class="metric-card">
-            <div class="metric-label">Carry distance</div>
-            <div class="metric-value">
-              <span id="carryDistanceValue">0</span>
-              <span class="metric-unit">yd</span>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Peak height</div>
-            <div class="metric-value">
-              <span id="peakHeightValue">0</span>
-              <span class="metric-unit">yd</span>
-            </div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label">Offline</div>
-            <div class="metric-value">
-              <span id="offlineValue">0</span>
-              <span class="metric-unit">yd</span>
-            </div>
-          </div>
-        </div>
-      </section>
+    def _capture_loop(self, duration_sec=1.0):
+        cap = cv2.VideoCapture(self.url)
+        start = time.time()
+        self.frames = []
+        while self.running and (time.time() - start) < duration_sec:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            self.frames.append(frame)
+            # Show preview window (optional)
+            preview = cv2.resize(frame, (400, 225))
+            cv2.imshow("Phone Camera Preview", preview)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        cap.release()
+        cv2.destroyAllWindows()
+        self.running = False
 
-      <!-- RIGHT: Course view -->
-      <section class="panel">
-        <h2>Virtual golf hole view</h2>
-        <p class="section-subtitle">
-          The on‑screen ball flight mirrors the predicted ball speed, launch angle, and direction.
-        </p>
-        <div class="course-container">
-          <canvas id="courseCanvas"></canvas>
-          <div class="overlay-info">
-            <div><strong>Shot status:</strong></div>
-            <div class="shot-status" id="shotStatusText">
-              Waiting for shot… start the camera and tap “Record shot”.
-            </div>
-          </div>
-        </div>
-      </section>
-    </div>
-  </main>
+    def start_capture(self, duration_sec=1.0):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, args=(duration_sec,))
+        self.thread.start()
 
-  <footer>
-    This is a prediction‑based prototype. Numbers are estimated in code, not measured from the camera.
-  </footer>
+    def wait_until_done(self):
+        if self.thread is not None:
+            self.thread.join()
 
-  <script>
-    // ---------------- PWA SERVICE WORKER REGISTRATION ----------------
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", () => {
-        navigator.serviceWorker
-          .register("service-worker.js")
-          .catch((err) => console.log("SW registration failed:", err));
-      });
-    }
+    def estimate_shot_from_frames(self):
+        """
+        Placeholder: use captured frames to estimate club/ball speed and carry.
 
-    // ---------------- CAMERA PREVIEW ----------------
-    const cameraVideo = document.getElementById("camera");
-    const startCameraBtn = document.getElementById("startCameraBtn");
-    const recordShotBtn = document.getElementById("recordShotBtn");
+        Right now, we just:
+        - If we have frames, pretend we saw a decent swing and return a
+          slightly randomized club speed.
+        - In a real system, you'd track the club/ball across frames and
+          compute pixel velocity -> real velocity using calibration.
+        """
+        if not self.frames:
+            return None
 
-    let captureCanvas = document.createElement("canvas");
-    let captureCtx = captureCanvas.getContext("2d");
-    let capturing = false;
-    let capturedFrames = [];
+        # Fake estimation based on number of frames
+        n = len(self.frames)
+        # Rough heuristic: more frames -> slower swing (completely made up)
+        base_club_speed = 45.0  # m/s
+        club_speed = base_club_speed * (0.8 + 0.4 * np.random.rand())
+        swing_speed = 5.0 * (0.8 + 0.4 * np.random.rand())
 
-    startCameraBtn.addEventListener("click", async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false,
-        });
-        cameraVideo.srcObject = stream;
-        startCameraBtn.textContent = "Camera running";
-        startCameraBtn.disabled = true;
-      } catch (err) {
-        alert("Could not access camera: " + err.message);
-      }
-    });
+        # Simple smash factor
+        ball_speed = 1.45 * club_speed
 
-    recordShotBtn.addEventListener("click", () => {
-      if (!cameraVideo.srcObject) {
-        alert("Start the camera first.");
-        return;
-      }
-      if (capturing) return;
+        # Simple carry estimate using projectile motion at 15 degrees
+        launch_angle_deg = 15.0
+        angle_rad = math.radians(launch_angle_deg)
+        carry = (ball_speed ** 2 * math.sin(2 * angle_rad)) / GRAVITY
 
-      capturedFrames = [];
-      capturing = true;
-      recordShotBtn.textContent = "Recording…";
-      recordShotBtn.disabled = true;
-      shotStatusText.textContent = "Recording frames around the swing…";
-
-      const captureDurationMs = 1000;
-      const frameIntervalMs = 40;
-      const startTime = performance.now();
-
-      function captureLoop() {
-        if (!capturing) return;
-
-        const now = performance.now();
-        if (now - startTime > captureDurationMs) {
-          capturing = false;
-          processCapturedFrames();
-          return;
+        return {
+            "club_speed": club_speed,
+            "swing_speed": swing_speed,
+            "ball_speed": ball_speed,
+            "launch_angle_deg": launch_angle_deg,
+            "carry": carry,
         }
 
-        const vw = cameraVideo.videoWidth;
-        const vh = cameraVideo.videoHeight;
-        if (vw && vh) {
-          captureCanvas.width = vw;
-          captureCanvas.height = vh;
-          captureCtx.drawImage(cameraVideo, 0, 0, vw, vh);
-          const frameData = captureCtx.getImageData(0, 0, vw, vh);
-          capturedFrames.push(frameData);
-        }
 
-        setTimeout(captureLoop, frameIntervalMs);
-      }
+# ==========================
+# SHOT PANEL UI
+# ==========================
+class ShotPanel:
+    def __init__(self):
+        self.visible = False
+        self.use_camera = False
+        self.club_speed = 45.0
+        self.swing_speed = 5.0
+        self.launch_angle = 15.0
+        self.carry_estimate = 0.0
+        self.last_from_camera = False
 
-      captureLoop();
-    });
+    def toggle(self):
+        self.visible = not self.visible
 
-    // ---------------- PREDICTION LOGIC ----------------
-    function predictLaunchFromFrames(frames) {
-      // Fake prediction: realistic‑looking numbers tied together.
+    def toggle_camera(self):
+        self.use_camera = not self.use_camera
 
-      const clubSpeed = 80 + Math.random() * 30; // 80–110 mph
-      const smash = 1.35 + Math.random() * 0.15; // 1.35–1.5
-      const ballSpeed = clubSpeed * smash;
-      const launchAngle = 8 + Math.random() * 10; // 8–18°
-      const direction = (Math.random() - 0.5) * 16; // -8° to +8°
+    def adjust_club_speed(self, delta):
+        self.club_speed = max(5.0, min(80.0, self.club_speed + delta))
 
-      return {
-        clubSpeed,
-        ballSpeed,
-        launchAngle,
-        direction,
-      };
-    }
+    def adjust_launch_angle(self, delta):
+        self.launch_angle = max(5.0, min(35.0, self.launch_angle + delta))
 
-    // ---------------- CANVAS / COURSE DRAWING ----------------
-    const canvas = document.getElementById("courseCanvas");
-    const ctx = canvas.getContext("2d");
+    def build_shot(self):
+        # Smash factor
+        ball_speed = 1.45 * self.club_speed
+        # Simple carry estimate
+        angle_rad = math.radians(self.launch_angle)
+        carry = (ball_speed ** 2 * math.sin(2 * angle_rad)) / GRAVITY
+        self.carry_estimate = carry
+        return ShotData(
+            club_speed=self.club_speed,
+            swing_speed=self.swing_speed,
+            ball_speed=ball_speed,
+            launch_angle_deg=self.launch_angle,
+            carry_estimate=carry,
+        )
 
-    function resizeCanvas() {
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = rect.width * window.devicePixelRatio;
-      canvas.height = rect.height * window.devicePixelRatio;
-      ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
-      drawCourseBackground();
-    }
+    def build_shot_from_camera_estimate(self, est):
+        self.club_speed = est["club_speed"]
+        self.swing_speed = est["swing_speed"]
+        self.launch_angle = est["launch_angle_deg"]
+        self.carry_estimate = est["carry"]
+        return ShotData(
+            club_speed=self.club_speed,
+            swing_speed=self.swing_speed,
+            ball_speed=est["ball_speed"],
+            launch_angle_deg=self.launch_angle,
+            carry_estimate=self.carry_estimate,
+        )
 
-    window.addEventListener("resize", resizeCanvas);
-    window.addEventListener("orientationchange", () => {
-      setTimeout(resizeCanvas, 300);
-    });
 
-    function drawCourseBackground() {
-      const w = canvas.width / window.devicePixelRatio;
-      const h = canvas.height / window.devicePixelRatio;
+def draw_shot_panel(surface, panel: ShotPanel):
+    if not panel.visible:
+        return
 
-      const grad = ctx.createLinearGradient(0, 0, 0, h);
-      grad.addColorStop(0, "#14532d");
-      grad.addColorStop(0.4, "#166534");
-      grad.addColorStop(1, "#15803d");
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, w, h);
+    panel_rect = pygame.Rect(50, 120, 400, 220)
+    pygame.draw.rect(surface, PANEL_BG, panel_rect)
+    pygame.draw.rect(surface, PANEL_BORDER, panel_rect, 2)
 
-      ctx.fillStyle = "#064e3b";
-      ctx.fillRect(w * 0.45, h * 0.8, w * 0.1, h * 0.05);
+    title = BIG_FONT.render("Shot Panel", True, PANEL_TEXT)
+    surface.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
 
-      ctx.strokeStyle = "rgba(209, 250, 229, 0.4)";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 6]);
-      ctx.beginPath();
-      ctx.moveTo(w * 0.5, h * 0.8);
-      ctx.lineTo(w * 0.5, h * 0.1);
-      ctx.stroke();
-      ctx.setLineDash([]);
+    y = panel_rect.y + 60
 
-      ctx.fillStyle = "#22c55e";
-      ctx.beginPath();
-      ctx.ellipse(w * 0.5, h * 0.12, w * 0.12, h * 0.05, 0, 0, Math.PI * 2);
-      ctx.fill();
+    def draw_label_value(label, value, y_pos):
+        text = FONT.render(f"{label}: {value}", True, PANEL_TEXT)
+        surface.blit(text, (panel_rect.x + 20, y_pos))
 
-      ctx.strokeStyle = "#e5e7eb";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(w * 0.5, h * 0.12);
-      ctx.lineTo(w * 0.5, h * 0.03);
-      ctx.stroke();
+    draw_label_value("Club speed (m/s)", f"{panel.club_speed:.1f}", y)
+    y += 25
+    draw_label_value("Launch angle (deg)", f"{panel.launch_angle:.1f}", y)
+    y += 25
+    draw_label_value("Swing speed (m/s)", f"{panel.swing_speed:.1f}", y)
+    y += 25
+    draw_label_value("Carry estimate (m)", f"{panel.carry_estimate:.1f}", y)
+    y += 25
 
-      ctx.fillStyle = "#ef4444";
-      ctx.beginPath();
-      ctx.moveTo(w * 0.5, h * 0.03);
-      ctx.lineTo(w * 0.5 + w * 0.05, h * 0.05);
-      ctx.lineTo(w * 0.5, h * 0.07);
-      ctx.closePath();
-      ctx.fill();
-    }
+    cam_label = "ON" if panel.use_camera else "OFF"
+    cam_color = PANEL_HIGHLIGHT if panel.use_camera else PANEL_TEXT
+    cam_text = FONT.render(f"Use phone camera: {cam_label}", True, cam_color)
+    surface.blit(cam_text, (panel_rect.x + 20, y))
+    y += 25
 
-    resizeCanvas();
+    hint_lines = [
+        "Controls:",
+        "S: toggle panel",
+        "C: toggle camera mode",
+        "Arrows: adjust club/angle",
+        "ENTER: fire shot",
+    ]
+    for line in hint_lines:
+        t = FONT.render(line, True, PANEL_TEXT)
+        surface.blit(t, (panel_rect.x + 20, y))
+        y += 18
 
-    // ---------------- SHOT SIMULATION ----------------
-    const clubSpeedValue = document.getElementById("clubSpeedValue");
-    const ballSpeedValue = document.getElementById("ballSpeedValue");
-    const launchAngleValue = document.getElementById("launchAngleValue");
-    const directionValue = document.getElementById("directionValue");
 
-    const carryDistanceValue = document.getElementById("carryDistanceValue");
-    const peakHeightValue = document.getElementById("peakHeightValue");
-    const offlineValue = document.getElementById("offlineValue");
-    const shotStatusText = document.getElementById("shotStatusText");
+# ==========================
+# RENDERING
+# ==========================
+def draw_hole(surface, game_state: GameState):
+    hole = game_state.current_hole
 
-    let animationId = null;
+    surface.fill(BACKGROUND)
+    pygame.draw.rect(surface, DARK_GREEN, pygame.Rect(0, SCREEN_HEIGHT - 50, SCREEN_WIDTH, 50))
+    pygame.draw.rect(surface, FAIRWAY, hole.fairway_rect)
+    pygame.draw.rect(surface, GREEN, hole.green_rect)
 
-    function processCapturedFrames() {
-      recordShotBtn.textContent = "Record shot";
-      recordShotBtn.disabled = false;
+    for b in hole.bunker_rects:
+        pygame.draw.rect(surface, SAND, b)
 
-      if (!capturedFrames.length) {
-        shotStatusText.textContent = "No frames captured. Try again.";
-        return;
-      }
+    pygame.draw.line(surface, WHITE, (hole.pin_pos[0], hole.pin_pos[1]),
+                     (hole.pin_pos[0], hole.pin_pos[1] - 60), 3)
+    pygame.draw.polygon(
+        surface,
+        RED,
+        [
+            (hole.pin_pos[0], hole.pin_pos[1] - 60),
+            (hole.pin_pos[0] + 30, hole.pin_pos[1] - 50),
+            (hole.pin_pos[0], hole.pin_pos[1] - 40),
+        ],
+    )
+    pygame.draw.circle(surface, BLUE, hole.tee_pos, 8)
 
-      const { clubSpeed, ballSpeed, launchAngle, direction } =
-        predictLaunchFromFrames(capturedFrames);
 
-      clubSpeedValue.textContent = clubSpeed.toFixed(0);
-      ballSpeedValue.textContent = ballSpeed.toFixed(0);
-      launchAngleValue.textContent = launchAngle.toFixed(1);
-      directionValue.textContent = direction.toFixed(1);
+def draw_ball(surface, ball: Ball):
+    pygame.draw.circle(surface, WHITE, (int(ball.x), int(ball.y)), 6)
 
-      simulateShot(ballSpeed, launchAngle, direction);
-    }
 
-    function simulateShot(ballSpeedMph, launchAngleDeg, directionDeg) {
-      const mphToMps = 0.44704;
-      const yardsPerMeter = 1.09361;
-      const v0 = ballSpeedMph * mphToMps;
-      const angleRad = (launchAngleDeg * Math.PI) / 180;
-      const dirRad = (directionDeg * Math.PI) / 180;
-      const g = 9.81;
+def draw_ui(surface, game_state: GameState):
+    hole = game_state.current_hole
+    pygame.draw.rect(surface, GREY, pygame.Rect(0, 0, SCREEN_WIDTH, 80))
 
-      const rangeMeters = (v0 * v0 * Math.sin(2 * angleRad)) / g;
-      const carryYards = rangeMeters * yardsPerMeter;
+    text = BIG_FONT.render(f"Hole {hole.index}  Par {hole.par}", True, WHITE)
+    surface.blit(text, (20, 20))
 
-      const peakMeters = (v0 * v0 * Math.sin(angleRad) * Math.sin(angleRad)) / (2 * g);
-      const peakYards = peakMeters * yardsPerMeter;
+    strokes = game_state.strokes_per_hole[hole.index - 1]
+    score_text = FONT.render(f"Strokes this hole: {strokes}", True, WHITE)
+    surface.blit(score_text, (300, 20))
 
-      const offlineMeters = rangeMeters * Math.sin(dirRad);
-      const offlineYards = offlineMeters * yardsPerMeter;
+    total_text = FONT.render(f"Total strokes: {game_state.total_strokes}", True, WHITE)
+    surface.blit(total_text, (300, 45))
 
-      carryDistanceValue.textContent = carryYards.toFixed(0);
-      peakHeightValue.textContent = peakYards.toFixed(0);
-      offlineValue.textContent = offlineYards.toFixed(1);
+    if game_state.last_shot_data:
+        s = game_state.last_shot_data
+        shot_str = (
+            f"Club: {s.club_speed:.1f} m/s  "
+            f"Swing: {s.swing_speed:.1f} m/s  "
+            f"Ball: {s.ball_speed:.1f} m/s  "
+            f"Angle: {s.launch_angle_deg:.1f}°  "
+            f"Carry: {s.carry_estimate:.1f} m"
+        )
+        shot_text = FONT.render(shot_str, True, WHITE)
+        surface.blit(shot_text, (550, 20))
 
-      shotStatusText.textContent =
-        "Shot in the air… Predicted ball speed " +
-        ballSpeedMph.toFixed(0) +
-        " mph, launch " +
-        launchAngleDeg.toFixed(1) +
-        "°, direction " +
-        directionDeg.toFixed(1) +
-        "°. Carry " +
-        carryYards.toFixed(0) +
-        " yd, offline " +
-        offlineYards.toFixed(1) +
-        " yd.";
+    msg_text = FONT.render(game_state.message, True, WHITE)
+    surface.blit(msg_text, (20, 55))
 
-      drawCourseBackground();
-      if (animationId) cancelAnimationFrame(animationId);
+    card_y = 85
+    card_text = FONT.render("Scorecard (strokes):", True, BLACK)
+    surface.blit(card_text, (20, card_y))
+    card_y += 20
 
-      const w = canvas.width / window.devicePixelRatio;
-      const h = canvas.height / window.devicePixelRatio;
+    for i, s in enumerate(game_state.strokes_per_hole):
+        hole_str = f"H{i+1}: {s}" if s > 0 else f"H{i+1}: -"
+        t = FONT.render(hole_str, True, BLACK)
+        surface.blit(t, (20 + (i % 9) * 60, card_y + (i // 9) * 20))
 
-      const maxDisplayYards = 300;
-      const scaleForward = (h * 0.7) / maxDisplayYards;
-      const scaleLateral = (w * 0.4) / maxDisplayYards;
 
-      const teeX = w * 0.5;
-      const teeY = h * 0.8;
+# ==========================
+# MAIN LOOP
+# ==========================
+def main():
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption("Golf Simulator with Phone Camera")
+    clock = pygame.time.Clock()
 
-      const totalTime = (2 * v0 * Math.sin(angleRad)) / g;
-      const steps = 120;
-      const dt = totalTime / steps;
-      let t = 0;
+    holes = create_sample_course()
+    game_state = GameState(holes)
+    shot_panel = ShotPanel()
+    camera_capture = CameraCapture(PHONE_CAM_URL)
 
-      function animate() {
-        drawCourseBackground();
+    running = True
+    while running:
+        dt = clock.tick(FPS) / 1000.0
 
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = "#facc15";
-        ctx.beginPath();
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
 
-        let firstPoint = true;
-        let lastX = teeX;
-        let lastY = teeY;
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
 
-        for (let i = 0; i <= steps; i++) {
-          const ti = dt * i;
-          const xMeters = v0 * Math.cos(angleRad) * ti;
-          const yMeters = v0 * Math.sin(angleRad) * ti - 0.5 * g * ti * ti;
+                elif event.key == pygame.K_s:
+                    shot_panel.toggle()
 
-          if (yMeters < 0) break;
+                elif event.key == pygame.K_c:
+                    shot_panel.toggle_camera()
+                    game_state.message = (
+                        "Camera mode ON." if shot_panel.use_camera else "Camera mode OFF."
+                    )
 
-          const forwardYards = xMeters * yardsPerMeter;
-          const canvasY = teeY - forwardYards * scaleForward;
+                elif event.key == pygame.K_UP:
+                    shot_panel.adjust_launch_angle(1.0)
 
-          const lateralYards = forwardYards * Math.tan(dirRad);
-          const canvasX = teeX + lateralYards * scaleLateral;
+                elif event.key == pygame.K_DOWN:
+                    shot_panel.adjust_launch_angle(-1.0)
 
-          if (firstPoint) {
-            ctx.moveTo(canvasX, canvasY);
-            firstPoint = false;
-          } else {
-            ctx.lineTo(canvasX, canvasY);
-          }
+                elif event.key == pygame.K_RIGHT:
+                    shot_panel.adjust_club_speed(1.0)
 
-          lastX = canvasX;
-          lastY = canvasY;
-        }
+                elif event.key == pygame.K_LEFT:
+                    shot_panel.adjust_club_speed(-1.0)
 
-        ctx.stroke();
+                elif event.key == pygame.K_RETURN:
+                    if not game_state.hole_finished and not game_state.ball.in_flight:
+                        # Fire shot
+                        if shot_panel.use_camera:
+                            game_state.message = "Capturing from phone camera..."
+                            camera_capture.start_capture(duration_sec=1.0)
+                            camera_capture.wait_until_done()
+                            est = camera_capture.estimate_shot_from_frames()
+                            if est is not None:
+                                shot_data = shot_panel.build_shot_from_camera_estimate(est)
+                                game_state.message = (
+                                    "Shot estimated from camera. Ball in flight..."
+                                )
+                            else:
+                                # Fallback to panel values
+                                shot_data = shot_panel.build_shot()
+                                game_state.message = (
+                                    "Camera failed, using panel values. Ball in flight..."
+                                )
+                        else:
+                            shot_data = shot_panel.build_shot()
+                            game_state.message = "Ball in flight..."
 
-        ctx.fillStyle = "#fefce8";
-        ctx.beginPath();
-        ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
-        ctx.fill();
+                        game_state.register_shot(shot_data)
+                        game_state.ball.launch(shot_data)
 
-        ctx.fillStyle = "#e5e7eb";
-        ctx.beginPath();
-        ctx.arc(teeX, teeY, 4, 0, Math.PI * 2);
-        ctx.fill();
+                elif event.key == pygame.K_n:
+                    if game_state.hole_finished:
+                        game_state.next_hole()
 
-        t += dt;
-        if (t < totalTime) {
-          animationId = requestAnimationFrame(animate);
-        } else {
-          shotStatusText.textContent =
-            "Shot finished. Carry " +
-            carryYards.toFixed(0) +
-            " yd, offline " +
-            offlineYards.toFixed(1) +
-            " yd. On‑screen flight mirrors the predicted launch data.";
-        }
-      }
+        if game_state.ball.in_flight:
+            game_state.ball.update(dt)
+            if not game_state.ball.in_flight:
+                check_landing_zone(game_state)
 
-      animate();
-    }
-  </script>
-</body>
-</html>
+        draw_hole(screen, game_state)
+        draw_ball(screen, game_state.ball)
+        draw_ui(screen, game_state)
+        draw_shot_panel(screen, shot_panel)
+
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
